@@ -11,6 +11,11 @@ import type {
   TripInput,
 } from "@/domain/trip";
 import { track } from "@/lib/analytics";
+import {
+  DESTINATION_AIRPORT_CODES,
+  fetchCheapestFlight,
+  type FlightOffer,
+} from "@/lib/flights";
 import { loadConfirmedTrip, saveConfirmedTrip } from "@/lib/storage";
 import {
   calculateBookedAmount,
@@ -39,12 +44,6 @@ const defaultSearchState: SearchState = {
   children: 0,
   infants: 0,
 };
-
-const flightOptions = [
-  { id: "qatar", airline: "Qatar Airways", route: "Baku → Hanoi", stops: "1 stop", amount: 720 },
-  { id: "turkish", airline: "Turkish Airlines", route: "Baku → Hanoi", stops: "1 stop", amount: 780 },
-  { id: "etihad", airline: "Etihad", route: "Baku → Hanoi", stops: "1 stop", amount: 820 },
-];
 
 const destinationSuggestions = [
   {
@@ -106,6 +105,7 @@ const styleContent: Record<
 const weekdayLabels = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 const flexibilityChips = ["Exact dates", "± 1 day", "± 2 days", "± 3 days", "± 7 days"];
 const appBasePath = "/travel";
+
 function searchStateToTripInput(state: SearchState, travelStyle: TravelStyle): TripInput {
   return {
     destination: state.destination ?? "Vietnam",
@@ -173,6 +173,17 @@ function formatGroupName(group: ChecklistGroup): string {
   return group.charAt(0).toUpperCase() + group.slice(1);
 }
 
+function formatFlightDate(value: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+  }).format(new Date(value));
+}
+
+function formatTransferCount(transfers: number): string {
+  return transfers === 0 ? "Direct" : `${transfers} stop${transfers > 1 ? "s" : ""}`;
+}
+
 export default function Page() {
   const [searchState, setSearchState] = useState<SearchState>(defaultSearchState);
   const [step, setStep] = useState<"search" | "loading" | "itinerary" | "dashboard">(
@@ -187,6 +198,9 @@ export default function Page() {
   const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
   const [shouldAdvanceFromDates, setShouldAdvanceFromDates] = useState(false);
   const [heroSlideIndex, setHeroSlideIndex] = useState(0);
+  const [cheapestFlight, setCheapestFlight] = useState<FlightOffer | null>(null);
+  const [isFlightLoading, setIsFlightLoading] = useState(false);
+  const [flightError, setFlightError] = useState<string | null>(null);
   const [recentSearches, setRecentSearches] = useState<SearchState[]>(() => {
     if (typeof window === "undefined") {
       return [];
@@ -304,6 +318,8 @@ export default function Page() {
     [generatedStyle, searchState],
   );
 
+  const destinationAirportCode = DESTINATION_AIRPORT_CODES[input.destination] ?? null;
+
   const template = useMemo(
     () => generateMockTrip(input),
     [input],
@@ -380,6 +396,44 @@ export default function Page() {
 
     return () => window.clearInterval(timer);
   }, [heroSlides.length, step]);
+
+  useEffect(() => {
+    if (!destinationAirportCode) {
+      setCheapestFlight(null);
+      setFlightError(null);
+      setIsFlightLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+
+    setIsFlightLoading(true);
+    setFlightError(null);
+
+    fetchCheapestFlight(destinationAirportCode, controller.signal)
+      .then((flight) => {
+        setCheapestFlight(flight);
+        if (!flight) {
+          setFlightError("No live fares found right now.");
+        }
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        console.error("Failed to load flights", error);
+        setCheapestFlight(null);
+        setFlightError("Live fares are temporarily unavailable.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setIsFlightLoading(false);
+        }
+      });
+
+    return () => controller.abort();
+  }, [destinationAirportCode]);
 
   const filteredSuggestions = useMemo(() => {
     const normalized = debouncedWhereQuery.trim().toLowerCase();
@@ -509,20 +563,19 @@ export default function Page() {
     track("checklist_item_completed", { itemId });
   }
 
-  function bookFlight(optionId: string) {
-    const option = flightOptions.find((entry) => entry.id === optionId);
+  function bookFlight(option: FlightOffer | null) {
     if (!option) {
       return;
     }
 
     patchTrip((trip) => {
       const booking: Booking = {
-        id: `flight-${option.id}`,
+        id: `flight-${option.airline}-${option.flight_number}-${option.departure_at}`,
         type: "flight",
-        title: `${option.airline} · ${option.route}`,
-        amount: option.amount,
+        title: `${option.airline} ${option.flight_number} · BAK → ${option.destination}`,
+        amount: option.price,
         createdAt: new Date().toISOString(),
-        details: `${option.stops} · Demo price`,
+        details: `${formatTransferCount(option.transfers)} · ${formatFlightDate(option.departure_at)}`,
       };
       const checklist = updateChecklistStatus(trip.checklist, "flight-main", "completed");
       const bookings = [...trip.bookings.filter((item) => item.type !== "flight"), booking];
@@ -536,8 +589,15 @@ export default function Page() {
       };
     });
 
-    track("flight_booking_started", { optionId });
-    track("flight_booked", { optionId, amount: option.amount });
+    track("flight_booking_started", {
+      airline: option.airline,
+      flightNumber: option.flight_number,
+    });
+    track("flight_booked", {
+      airline: option.airline,
+      flightNumber: option.flight_number,
+      amount: option.price,
+    });
   }
 
   function buyAddon(type: "insurance" | "esim") {
@@ -637,6 +697,18 @@ export default function Page() {
   }
 
   const isItineraryScreen = step === "itinerary";
+  const flightSummaryValue = isFlightLoading
+    ? "Loading..."
+    : cheapestFlight
+      ? `≈ ${formatCurrency(cheapestFlight.price)}`
+      : "Unavailable";
+
+  const flightSummaryMeta = isFlightLoading
+    ? "Checking live fares..."
+    : cheapestFlight
+      ? `${cheapestFlight.airline} · ${formatFlightDate(cheapestFlight.departure_at)}\n${formatTransferCount(cheapestFlight.transfers)}`
+      : flightError ?? "Try again later.";
+
   return (
     <main
       className={`flex min-h-screen w-full flex-col ${
@@ -962,10 +1034,10 @@ export default function Page() {
 
           <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
             {[
-              ["☼", "Season fit", "Great", "Dec is dry season in most regions. Pleasant weather throughout the trip.", "text-emerald-600"],
-              ["🛂", "Visa for Azerbaijani citizens", "Required", "E-visa available. Processing: ~3 business days.", "text-[color:var(--brand)]"],
-              ["◔", "Budget (per traveler)", `≈ ${formatCurrency(budget.total)}`, `Estimated total cost\nRange: ${formatCurrency(Math.round(budget.total * 0.95))} - ${formatCurrency(Math.round(budget.total * 1.15))}`, "text-orange-500"],
-              ["✈", "Flights & difficulty", `≈ ${formatCurrency(700)}`, "1 stop · 14-18h total\nMedium difficulty", "text-blue-600"],
+              ["☼", "Season", "Good", "Dry season in most regions.", "text-emerald-600"],
+              ["🛂", "Visa", "Required", "E-visa · ~3 business days.", "text-[color:var(--brand)]"],
+              ["◔", "Budget", `≈ ${formatCurrency(budget.total)}`, `Per traveler\n${formatCurrency(Math.round(budget.total * 0.95))} - ${formatCurrency(Math.round(budget.total * 1.15))}`, "text-orange-500"],
+              ["✈", "Flights", flightSummaryValue, flightSummaryMeta, "text-blue-600"],
             ].map(([icon, label, value, meta, accent]) => (
               <article key={label} className="rounded-[28px] border border-[color:var(--border)] bg-white p-5 shadow-[var(--shadow-soft)]">
                 <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[color:var(--surface-accent)] text-xl text-[color:var(--brand-strong)]">
@@ -1198,7 +1270,11 @@ export default function Page() {
                   </button>
                 ) : null}
                 <span className="rounded-full bg-[color:var(--brand-soft)] px-4 py-3 text-sm font-semibold text-[color:var(--brand-strong)]">
-                  Estimated {formatCurrency(720)}
+                  {isFlightLoading
+                    ? "Checking fares..."
+                    : cheapestFlight
+                      ? `From ${formatCurrency(cheapestFlight.price)}`
+                      : "Fare unavailable"}
                 </span>
               </div>
             </article>
@@ -1251,41 +1327,46 @@ export default function Page() {
 
           <section className="grid gap-8 xl:grid-cols-[1.05fr_0.95fr]">
             <div className="space-y-4">
-              <Panel title="Mock flight booking">
+              <Panel title="Flight booking">
                 <div className="space-y-3">
-                  {flightOptions.map((option, index) => (
+                  {isFlightLoading ? (
                     <div
-                      key={option.id}
-                      className={`flex flex-col gap-3 rounded-[24px] border p-4 md:flex-row md:items-center md:justify-between ${
-                        index === 0
-                          ? "border-[color:var(--brand)] bg-[color:var(--brand-soft)]"
-                          : "border-[color:var(--border)] bg-[color:var(--surface-muted)]"
-                      }`}
+                      className="flex flex-col gap-3 rounded-[24px] border border-[color:var(--brand)] bg-[color:var(--brand-soft)] p-4 md:flex-row md:items-center md:justify-between"
                     >
                       <div>
-                        <p className="font-semibold">
-                          {option.airline} {index === 0 ? "· Recommended" : ""}
-                        </p>
+                        <p className="font-semibold">Checking live flights...</p>
                         <p className="text-sm text-[color:var(--text-soft)]">
-                          {option.route} · {option.stops} · Demo price
+                          Looking for the best fare from GYD to {destinationAirportCode ?? "SGN"}.
+                        </p>
+                      </div>
+                    </div>
+                  ) : cheapestFlight ? (
+                    <div className="flex flex-col gap-3 rounded-[24px] border border-[color:var(--brand)] bg-[color:var(--brand-soft)] p-4 md:flex-row md:items-center md:justify-between">
+                      <div>
+                        <p className="font-semibold">{cheapestFlight.airline} · Recommended</p>
+                        <p className="text-sm text-[color:var(--text-soft)]">
+                          BAK/GYD → {cheapestFlight.destination} · {formatTransferCount(cheapestFlight.transfers)} · {formatFlightDate(cheapestFlight.departure_at)}
                         </p>
                       </div>
                       <div className="flex items-center gap-3">
-                        <strong>{formatCurrency(option.amount)}</strong>
+                        <strong>{formatCurrency(cheapestFlight.price)}</strong>
                         <button
                           type="button"
-                          onClick={() => bookFlight(option.id)}
-                          className={`rounded-full px-4 py-2 text-sm font-semibold ${
-                            index === 0
-                              ? "bg-[image:var(--brand-gradient)] text-white"
-                              : "bg-white"
-                          }`}
+                          onClick={() => bookFlight(cheapestFlight)}
+                          className="rounded-full bg-[image:var(--brand-gradient)] px-4 py-2 text-sm font-semibold text-white"
                         >
                           Book
                         </button>
                       </div>
                     </div>
-                  ))}
+                  ) : (
+                    <div className="rounded-[24px] border border-[color:var(--border)] bg-[color:var(--surface-muted)] p-4">
+                      <p className="font-semibold">Live flights unavailable</p>
+                      <p className="mt-1 text-sm text-[color:var(--text-soft)]">
+                        {flightError ?? "We could not load fares right now. Please try again later."}
+                      </p>
+                    </div>
+                  )}
                 </div>
               </Panel>
 
