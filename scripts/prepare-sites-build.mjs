@@ -1,5 +1,15 @@
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, extname, join, normalize, resolve } from "node:path";
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { extname, join, relative, resolve, sep } from "node:path";
 
 const rootDir = process.cwd();
 const outDir = resolve(rootDir, "out");
@@ -9,6 +19,23 @@ const serverDir = join(distDir, "server");
 const hostingSource = resolve(rootDir, ".openai", "hosting.json");
 const hostingTargetDir = join(distDir, ".openai");
 const hostingTarget = join(hostingTargetDir, "hosting.json");
+
+function listFiles(directory) {
+  const entries = readdirSync(directory, { withFileTypes: true });
+  const files = [];
+
+  for (const entry of entries) {
+    const absolutePath = join(directory, entry.name);
+
+    if (entry.isDirectory()) {
+      files.push(...listFiles(absolutePath));
+    } else if (entry.isFile()) {
+      files.push(absolutePath);
+    }
+  }
+
+  return files;
+}
 
 if (!existsSync(outDir)) {
   throw new Error("Expected Next export output in ./out, but it was not found.");
@@ -26,13 +53,6 @@ if (existsSync(hostingSource)) {
 } else {
   writeFileSync(hostingTarget, JSON.stringify({}, null, 2));
 }
-
-const serverSource = `import { createReadStream, existsSync } from "node:fs";
-import { extname, join, normalize } from "node:path";
-import http from "node:http";
-
-const clientDir = join(process.cwd(), "dist", "client");
-const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 
 const contentTypes = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -52,50 +72,87 @@ const contentTypes = new Map([
   [".woff2", "font/woff2"],
 ]);
 
-function resolveCandidate(pathname) {
-  const safePath = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\\\])+/, "");
-  const directPath = join(clientDir, safePath);
+const assetEntries = listFiles(outDir).map((filePath) => {
+  const routePath = `/${relative(outDir, filePath).split(sep).join("/")}`;
+  const extension = extname(filePath).toLowerCase();
+  const contentType = contentTypes.get(extension) ?? "application/octet-stream";
+  const encoding = /^(text\/|application\/(javascript|json))/.test(contentType) ? "utf8" : null;
+  const content = readFileSync(filePath);
 
-  if (existsSync(directPath) && extname(directPath)) {
-    return directPath;
+  return {
+    path: routePath === "/index.html" ? "/" : routePath,
+    alternatePath: routePath,
+    contentType,
+    base64: content.toString("base64"),
+    cacheControl: routePath.startsWith("/_next/static/")
+      ? "public, max-age=31536000, immutable"
+      : routePath.endsWith(".html")
+        ? "no-cache"
+        : "public, max-age=3600",
+    size: statSync(filePath).size,
+    isHtml: routePath.endsWith(".html"),
+    encoding,
+  };
+});
+
+const serializedAssets = JSON.stringify(assetEntries);
+
+const serverSource = `const assetList = ${serializedAssets};
+
+const assets = new Map();
+
+for (const asset of assetList) {
+  assets.set(asset.path, asset);
+  if (asset.alternatePath && asset.alternatePath !== asset.path) {
+    assets.set(asset.alternatePath, asset);
   }
-
-  if (existsSync(join(clientDir, safePath, "index.html"))) {
-    return join(clientDir, safePath, "index.html");
-  }
-
-  if (existsSync(join(clientDir, safePath + ".html"))) {
-    return join(clientDir, safePath + ".html");
-  }
-
-  return join(clientDir, "index.html");
 }
 
-http
-  .createServer((req, res) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    const candidate = resolveCandidate(url.pathname === "/" ? "/index.html" : url.pathname);
-    const extension = extname(candidate).toLowerCase();
-    const contentType = contentTypes.get(extension) ?? "application/octet-stream";
+function decodeBase64(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
 
-    res.setHeader("Content-Type", contentType);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
 
-    if (candidate.endsWith(".html")) {
-      res.setHeader("Cache-Control", "no-cache");
-    } else if (url.pathname.startsWith("/_next/static/")) {
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  return bytes;
+}
+
+function resolveAsset(pathname) {
+  if (assets.has(pathname)) {
+    return assets.get(pathname);
+  }
+
+  if (assets.has(pathname + "/index.html")) {
+    return assets.get(pathname + "/index.html");
+  }
+
+  if (assets.has(pathname + ".html")) {
+    return assets.get(pathname + ".html");
+  }
+
+  return assets.get("/") ?? assets.get("/index.html") ?? null;
+}
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const asset = resolveAsset(url.pathname);
+
+    if (!asset) {
+      return new Response("Not found", { status: 404 });
     }
 
-    const stream = createReadStream(candidate);
-    stream.on("error", () => {
-      res.statusCode = 404;
-      res.end("Not found");
+    return new Response(decodeBase64(asset.base64), {
+      status: 200,
+      headers: {
+        "content-type": asset.contentType,
+        "cache-control": asset.cacheControl,
+      },
     });
-    stream.pipe(res);
-  })
-  .listen(port, () => {
-    console.log("Sites server listening on port", port);
-  });
+  },
+};
 `;
 
 writeFileSync(join(serverDir, "index.js"), serverSource);
