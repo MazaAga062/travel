@@ -29,12 +29,9 @@ if (existsSync(hostingSource)) {
 
 const serverSource = `import { createReadStream, existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
-import { fileURLToPath } from "node:url";
 import http from "node:http";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = normalize(__filename.replace(/[^/]+$/, ""));
-const clientDir = join(__dirname, "..", "client");
+const clientDir = join(process.cwd(), "dist", "client");
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 
 const contentTypes = new Map([
