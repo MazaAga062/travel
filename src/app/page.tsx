@@ -105,6 +105,7 @@ const styleContent: Record<
 
 const weekdayLabels = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 const flexibilityChips = ["Exact dates", "± 1 day", "± 2 days", "± 3 days", "± 7 days"];
+const appBasePath = "/travel";
 function searchStateToTripInput(state: SearchState, travelStyle: TravelStyle): TripInput {
   return {
     destination: state.destination ?? "Vietnam",
@@ -1421,7 +1422,7 @@ function BrandLockup() {
   return (
     <div className="min-w-0">
       <Image
-        src="/birtravel-logo.png"
+        src={`${appBasePath}/birtravel-logo.png`}
         alt="birtravel"
         width={302}
         height={84}

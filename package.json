@@ -4,7 +4,7 @@
   "description": "",
   "scripts": {
     "dev": "next dev",
-    "build": "next build && node scripts/prepare-sites-build.mjs",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint .",
     "test": "node --test"
